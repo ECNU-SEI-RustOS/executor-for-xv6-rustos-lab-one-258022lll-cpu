@@ -39,6 +39,8 @@ pub trait Syscall {
     fn sys_link(&mut self) -> SysResult;
     fn sys_mkdir(&mut self) -> SysResult;
     fn sys_close(&mut self) -> SysResult;
+    fn sys_trace(&mut self) -> SysResult;
+    fn sys_sysinfo(&mut self) -> SysResult;
 }
 
 impl Syscall for Proc {
@@ -143,6 +145,7 @@ impl Syscall for Proc {
     }
 
     /// Load an elf binary and execuate it the currrent process context.
+    /// Load an elf binary and execuate it the currrent process context.
     fn sys_exec(&mut self) -> SysResult {
         let mut path: [u8; MAXPATH] = [0; MAXPATH];
         self.arg_str(0, &mut path).map_err(syscall_warning)?;
@@ -187,6 +190,18 @@ impl Syscall for Proc {
 
         #[cfg(feature = "trace_syscall")]
         println!("[{}].exec({}, {:#x}) = {:?}", self.excl.lock().pid, String::from_utf8_lossy(&path), uargv, result);
+
+        // === 新增：PID 1 页表打印逻辑 ===
+        // 只有当 exec 成功时才打印，避免打印旧的页表
+        if result.is_ok() {
+            // 获取 PID，注意锁的生命周期，获取完立即释放
+            let pid = self.excl.lock().pid;
+            if pid == 1 {
+                // 调用你在 pagetable.rs 中实现的 vm_print
+                self.data.get_mut().pagetable.as_ref().unwrap().vm_print();
+            }
+        }
+        // ==============================
 
         if result.is_err() {
             syscall_warning(error);
@@ -496,6 +511,18 @@ impl Syscall for Proc {
         println!("[{}].close(fd={}), file={:?}", self.excl.lock().pid, fd, file);
 
         drop(file);
+        Ok(0)
+    }
+    fn sys_trace(&mut self) -> SysResult {
+        // 获取第一个参数 (mask)
+        let mask = self.arg_raw(0);
+        // 写入当前进程的 excl 结构
+        self.excl.lock().trace_mask = mask;
+        Ok(0)
+    }
+
+    fn sys_sysinfo(&mut self) -> SysResult {
+        // 暂时返回 0，为了编译通过
         Ok(0)
     }
 }

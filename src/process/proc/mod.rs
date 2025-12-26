@@ -59,6 +59,7 @@ pub struct ProcExcl {
     pub channel: usize,
     /// 进程的唯一标识符（进程ID）。
     pub pid: usize,
+    pub trace_mask: usize,
 }
 
 
@@ -69,6 +70,7 @@ impl ProcExcl {
             exit_status: 0,
             channel: 0,
             pid: 0,
+            trace_mask: 0,
         }
     }
 
@@ -78,6 +80,7 @@ impl ProcExcl {
         self.channel = 0;
         self.exit_status = 0;
         self.state = ProcState::UNUSED;
+        self.trace_mask = 0;
     }
 }
 
@@ -493,11 +496,14 @@ impl Proc {
     /// - 该函数应在内核上下文且进程排他访问时调用，避免数据竞争。
     /// - 系统调用执行过程中可能包含更底层的 `unsafe`，调用此函数时需确保整体安全环境。
     pub fn syscall(&mut self) {
-        sstatus::intr_on();
-
+        // 1. 获取 TrapFrame
         let tf = unsafe { self.data.get_mut().tf.as_mut().unwrap() };
         let a7 = tf.a7;
-        tf.admit_ecall();
+
+        // 2. ⚠️ 必须让 PC 指针前进，跳过 ecall 指令
+        tf.admit_ecall(); 
+
+        // 3. 分发系统调用
         let sys_result = match a7 {
             1 => self.sys_fork(),
             2 => self.sys_exit(),
@@ -520,16 +526,43 @@ impl Proc {
             19 => self.sys_link(),
             20 => self.sys_mkdir(),
             21 => self.sys_close(),
+            
+            // 🚨 你之前漏掉了这两行，所以报错了！🚨
+            22 => self.sys_trace(),
+            23 => self.sys_sysinfo(), 
+            
             _ => {
-                panic!("unknown syscall num: {}", a7);
+                // 如果遇到未知的系统调用，打印错误并返回 Err，不要直接 panic
+                // 这样至少 Shell 还能活下来
+                println!("unknown syscall num: {}", a7);
+                Err(())
             }
         };
+
+        // 4. 写入返回值
         tf.a0 = match sys_result {
             Ok(ret) => ret,
             Err(()) => -1isize as usize,
         };
-    }
 
+        // 5. 打印 Trace 信息
+        const SYSCALL_NAMES: [&str; 24] = [
+            "", "fork", "exit", "wait", "pipe", "read", "kill", "exec", 
+            "fstat", "chdir", "dup", "getpid", "sbrk", "sleep", "uptime", 
+            "open", "write", "mknod", "unlink", "link", "mkdir", "close", 
+            "trace", "sysinfo"
+        ];
+
+        // 使用局部作用域获取 mask，避免死锁
+        let (trace_mask, pid) = {
+            let guard = self.excl.lock();
+            (guard.trace_mask, guard.pid)
+        };
+
+        if a7 < SYSCALL_NAMES.len() && (trace_mask >> a7) & 1 == 1 {
+            println!("{}: syscall {} -> {}", pid, SYSCALL_NAMES[a7], tf.a0 as isize);
+        }
+    }
     /// # 功能说明
     /// 让出当前进程的 CPU 使用权，将进程状态从运行中（RUNNING）
     /// 改为可运行（RUNNABLE），并调用调度器进行上下文切换，
@@ -660,7 +693,15 @@ impl Proc {
     ///   假设指针有效且内存分配正确。
     /// - 调用者需保证进程状态和私有数据在调用时无并发冲突。
     /// - 子进程资源清理确保不产生内存泄漏和悬挂指针。
+    /// # 功能说明
+    /// 创建当前进程的一个子进程（fork），
+    /// 复制父进程的内存、TrapFrame、打开文件、当前工作目录等信息，
+    /// 并将子进程状态设置为可运行。
     fn fork(&mut self) -> Result<usize, ()> {
+        // 1. 【关键修改】先获取父进程的 trace_mask 并立即释放锁
+        // 这样避免在持有父进程锁的时候去请求子进程锁，防止死锁
+        let parent_mask = self.excl.lock().trace_mask; 
+
         let pdata = self.data.get_mut();
         let child = unsafe { PROC_MANAGER.alloc_proc().ok_or(())? };
         let mut cexcl = child.excl.lock();
@@ -683,6 +724,9 @@ impl Proc {
             ptr::copy_nonoverlapping(pdata.tf, cdata.tf, 1);
             cdata.tf.as_mut().unwrap().a0 = 0;
         }
+
+        // 2. 【关键修改】将掩码赋值给子进程
+        cexcl.trace_mask = parent_mask;
 
         // clone opened files and cwd
         cdata.open_files.clone_from(&pdata.open_files);
